@@ -4,6 +4,7 @@ import requests
 from telegram import Bot
 from telegram.ext import CommandHandler, MessageHandler, filters, Application
 from urllib.parse import urlparse, unquote
+import tqdm  # Add this import for progress bar
 
 # Set your bot token and channel name here
 BOT_TOKEN = "7754780590:AAHw6KkrB1ge8gxFr2iuqIp7gtMUMkyzkS0"  # Replace with your bot token
@@ -20,12 +21,6 @@ logger = logging.getLogger(__name__)
 def get_filename_from_url(url):
     """
     Extracts the filename from a given URL.
-
-    Args:
-        url (str): The URL of the file.
-
-    Returns:
-        str: The filename, or None if it cannot be extracted.
     """
     try:
         parsed_url = urlparse(url)
@@ -45,9 +40,9 @@ def get_filename_from_url(url):
         return None
 
 # Function to download file
-async def download_file(url):
+async def download_file(url, update, context):
     """
-    Downloads a file from a given URL.
+    Downloads a file from a given URL with progress bar.
     """
     try:
         # Remove @ if present at the start of URL
@@ -56,35 +51,59 @@ async def download_file(url):
 
         logger.info(f"Starting download from URL: {url}")
 
+        # Get filename from URL first
+        filename = get_filename_from_url(url)
+        if not filename:
+            await context.bot.send_message(chat_id=update.effective_chat.id, text="Error: Could not determine filename from URL")
+            return None, None
+
         # Add headers to mimic a browser request
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         }
 
+        # Get file size first
         response = requests.get(url, stream=True, headers=headers)
         response.raise_for_status()
+        total_size = int(response.headers.get('content-length', 0))
 
         # Get content type
         content_type = response.headers.get('content-type', '')
         logger.info(f"Content type: {content_type}")
 
-        # Determine file extension from content type or URL
-        if 'image/png' in content_type or url.endswith('.png'):
-            extension = '.png'
-        elif 'image/jpeg' in content_type or url.endswith('.jpg'):
-            extension = '.jpg'
-        elif 'image/gif' in content_type or url.endswith('.gif'):
-            extension = '.gif'
-        else:
-            extension = '.png'  # default to png for your case
-
-        filename = f"downloaded_image{extension}"
         filepath = filename
 
-        logger.info(f"Saving file as: {filepath}")
+        # Send initial progress message
+        progress_message = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"Downloading {filename}...\nProgress: 0%"
+        )
+
+        # Download with progress bar
         with open(filepath, 'wb') as file:
+            downloaded = 0
             for chunk in response.iter_content(chunk_size=8192):
-                file.write(chunk)
+                if chunk:
+                    file.write(chunk)
+                    downloaded += len(chunk)
+                    # Update progress every 5%
+                    progress = int((downloaded / total_size) * 100)
+                    if progress % 5 == 0:  # Update every 5%
+                        try:
+                            await context.bot.edit_message_text(
+                                chat_id=update.effective_chat.id,
+                                message_id=progress_message.message_id,
+                                text=f"Downloading {filename}...\nProgress: {progress}%"
+                            )
+                        except Exception as e:
+                            logger.error(f"Error updating progress: {e}")
+
+        # Send completion message
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=progress_message.message_id,
+            text=f"Download completed! Uploading {filename} to channel..."
+        )
 
         file_size = os.path.getsize(filepath)
         logger.info(f"File downloaded successfully. Size: {file_size} bytes")
@@ -103,14 +122,14 @@ async def upload_file_to_channel(bot, filepath, filename):
         logger.info(f"Attempting to upload file: {filename} (size: {file_size} bytes)")
 
         with open(filepath, 'rb') as file:
-            # For PNG files, we'll try sending as photo first
-            if filename.lower().endswith('.png'):
+            # Try to send as photo if it's an image
+            if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
                 try:
                     logger.info("Attempting to send as photo")
                     await bot.send_photo(
                         chat_id=CHANNEL_NAME,
                         photo=file,
-                        caption=f"Uploaded image from {filename}"
+                        caption=f"Uploaded file: {filename}"
                     )
                     logger.info("File uploaded successfully as photo")
                     return True
@@ -143,11 +162,12 @@ async def start(update, context):
         f"👋 Hello {user.first_name}! Welcome to the File Download Bot!\n\n"
         "🤖 I can help you download files from URLs and upload them to a Telegram channel.\n\n"
         "📝 Here's how to use me:\n"
-        "1. Simply send me any URL containing a file\n"
+        "1. Use the command /download followed by the URL\n"
         "2. I'll download the file\n"
         "3. Upload it to the specified channel\n"
         "4. Clean up after myself\n\n"
-        "❓ Need help? Just send me a URL and I'll handle the rest!\n"
+        "Example: /download https://example.com/file.pdf\n\n"
+        "❓ Need help? Just use /download with a URL and I'll handle the rest!\n"
         "⚠️ Note: Make sure the URL is accessible and contains a downloadable file."
     )
 
@@ -187,21 +207,25 @@ async def test_channel_access(update, context):
         logger.error(error_msg)
         await update.message.reply_text(error_msg)
 
-# Message handler for URLs
-async def handle_url(update, context):
+# Command handler for /download
+async def download_command(update, context):
     """
-    Handles messages containing URLs.
+    Handles the /download command.
     """
-    url = update.message.text.strip()
+    # Check if URL is provided
+    if not context.args:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Please provide a URL after the /download command.\nExample: /download https://example.com/file.pdf"
+        )
+        return
+
+    url = context.args[0]
     logger.info(f"Processing URL: {url}")
 
-    await context.bot.send_message(chat_id=update.effective_chat.id, text="Downloading file...")
-
     try:
-        filepath, filename = await download_file(url)
+        filepath, filename = await download_file(url, update, context)
         if filepath:
-            await context.bot.send_message(chat_id=update.effective_chat.id, text="File downloaded. Uploading to channel...")
-
             # Log channel information
             logger.info(f"Attempting to upload to channel: {CHANNEL_NAME}")
 
@@ -220,7 +244,7 @@ async def handle_url(update, context):
         else:
             await context.bot.send_message(chat_id=update.effective_chat.id, text="Error downloading file.")
     except Exception as e:
-        logger.error(f"Error in handle_url: {str(e)}")
+        logger.error(f"Error in download_command: {str(e)}")
         await context.bot.send_message(chat_id=update.effective_chat.id, text=f"An error occurred: {str(e)}")
 
 # Error handler
@@ -239,7 +263,7 @@ def main():
 
     # Add handlers
     application.add_handler(CommandHandler('start', start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
+    application.add_handler(CommandHandler('download', download_command))  # Add download command handler
     application.add_error_handler(error)
 
     # Start the Bot
