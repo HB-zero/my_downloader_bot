@@ -1,10 +1,9 @@
 import logging
 import os
 import requests
-from telegram import Bot
+from telegram import Bot, Update
 from telegram.ext import CommandHandler, MessageHandler, filters, Application
 from urllib.parse import urlparse, unquote
-import tqdm  # Add this import for progress bar
 import sys
 from datetime import datetime
 import time
@@ -12,15 +11,24 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import signal
 import asyncio
+import uuid
+from typing import Dict, Optional
+import atexit
 
 # Set your bot token and channel name here
 BOT_TOKEN = "7754780590:AAHw6KkrB1ge8gxFr2iuqIp7gtMUMkyzkS0"  # Replace with your bot token
 CHANNEL_NAME = "@my_course_site"  # Replace with your channel username or ID
 
-# Enable logging
+# Dictionary to store active downloads
+active_downloads: Dict[str, dict] = {}
+
+# Global variable for application
+application = None
+
+# Enable logging with INFO level
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.ERROR  # Changed from DEBUG to ERROR
+    level=logging.ERROR  # Set default to ERROR to suppress most logs
 )
 logger = logging.getLogger(__name__)
 
@@ -39,8 +47,14 @@ def get_filename_from_url(url):
         parts = path.split('/')
         # The filename is the last part of the path
         filename = parts[-1]
-        if not filename:
+
+        # If filename is empty or doesn't have an extension, return None
+        if not filename or '.' not in filename:
             return None
+
+        # Clean the filename (remove any query parameters)
+        filename = filename.split('?')[0]
+
         return filename
     except Exception as e:
         logger.error(f"Error extracting filename from URL: {e}")
@@ -71,15 +85,51 @@ def create_session_with_retry():
     session.mount("https://", adapter)
     return session
 
+def cleanup_files():
+    """
+    Cleanup function to remove any remaining files
+    """
+    for download_id, download_info in list(active_downloads.items()):
+        try:
+            if 'file_handle' in download_info and download_info['file_handle'] is not None:
+                try:
+                    download_info['file_handle'].close()
+                    logger.info(f"Closed file handle for {download_info['filepath']}")
+                except Exception as e:
+                    logger.error(f"Error closing file handle: {str(e)}")
+
+            if os.path.exists(download_info['filepath']):
+                os.remove(download_info['filepath'])
+                logger.info(f"Cleaned up file: {download_info['filepath']}")
+        except Exception as e:
+            logger.error(f"Error cleaning up file {download_info.get('filepath', 'unknown')}: {str(e)}")
+
+# Register cleanup function
+atexit.register(cleanup_files)
+
+def validate_url(url: str) -> bool:
+    """
+    Validates if the given string is a proper URL
+    """
+    try:
+        result = urlparse(url)
+        return all([result.scheme, result.netloc])
+    except:
+        return False
+
 # Function to download file
 async def download_file(url, update, context):
     """
     Downloads a file from a given URL with progress bar and streaming support.
     """
     try:
-        # Remove @ if present at the start of URL
-        if url.startswith('@'):
-            url = url[1:]
+        # Validate URL
+        if not validate_url(url):
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="❌ Invalid URL format. Please provide a complete URL starting with http:// or https://"
+            )
+            return None, None
 
         logger.info(f"Starting download from URL: {url}")
 
@@ -88,9 +138,12 @@ async def download_file(url, update, context):
         if not filename:
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
-                text="❌ Invalid URL. Please make sure you're using a valid file URL."
+                text="❌ Invalid URL. Please make sure the URL points to a file with a proper filename and extension."
             )
             return None, None
+
+        # Generate UUID for this download
+        download_id = str(uuid.uuid4())[:8]  # Using first 8 characters for shorter ID
 
         # Add headers to mimic a browser request
         headers = {
@@ -100,56 +153,132 @@ async def download_file(url, update, context):
         # Create session with retry logic
         session = create_session_with_retry()
 
-        # Get file size first
-        response = session.get(url, stream=True, headers=headers)
-        response.raise_for_status()
-        total_size = int(response.headers.get('content-length', 0))
+        try:
+            # Get file size first
+            response = session.get(url, stream=True, headers=headers)
+            response.raise_for_status()
+            total_size = int(response.headers.get('content-length', 0))
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to connect to URL: {str(e)}")
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="❌ Failed to connect to the URL. Please check if the URL is accessible."
+            )
+            return None, None
 
         filepath = filename
         max_retries = 3
         retry_count = 0
+        file_handle = None
 
         while retry_count < max_retries:
             try:
+                # Store download info (initialize with file_handle as None)
+                active_downloads[download_id] = {
+                    'user_id': update.effective_user.id,
+                    'filename': filename,
+                    'filepath': filepath,
+                    'total_size': total_size,
+                    'downloaded': 0,
+                    'cancelled': False,
+                    'completed': False,
+                    'start_time': datetime.now(),
+                    'file_handle': None,
+                    'progress_message_id': None
+                }
+
+                # Log new download
+                logger.info(f"New download started - ID: {download_id}, User: {update.effective_user.first_name} ({update.effective_user.id}), File: {filename}, Size: {format_size(total_size)}")
+
                 # Send initial progress message
                 progress_message = await context.bot.send_message(
                     chat_id=update.effective_chat.id,
                     text=f"⏳ Downloading {filename}...\n"
                          f"📦 Size: {format_size(total_size)}\n"
-                         f"📊 Progress: 0%"
+                         f"📊 Progress: 0%\n"
+                         f"🆔 Download ID: {download_id}\n"
+                         f"Use /cancel {download_id} to cancel this download"
                 )
 
-                # Download with progress bar
-                with open(filepath, 'wb') as file:
-                    downloaded = 0
-                    last_progress = -1
-                    chunk_size = 1024 * 1024  # 1MB chunks for better performance
+                # Store progress message ID
+                active_downloads[download_id]['progress_message_id'] = progress_message.message_id
 
-                    for chunk in response.iter_content(chunk_size=chunk_size):
-                        if chunk:
-                            file.write(chunk)
-                            downloaded += len(chunk)
-                            # Update progress every 1%
-                            progress = int((downloaded / total_size) * 100)
-                            if progress != last_progress:
-                                try:
-                                    await context.bot.edit_message_text(
-                                        chat_id=update.effective_chat.id,
-                                        message_id=progress_message.message_id,
-                                        text=f"⏳ Downloading {filename}...\n"
-                                             f"📦 Size: {format_size(total_size)}\n"
-                                             f"⬇️ Downloaded: {format_size(downloaded)}\n"
-                                             f"📊 Progress: {progress}%"
-                                    )
-                                    last_progress = progress
-                                except Exception as e:
-                                    if "Message is not modified" not in str(e):
-                                        logger.error(f"Progress update failed: {str(e)}")
+                # Download with progress bar
+                file_handle = open(filepath, 'wb')
+                active_downloads[download_id]['file_handle'] = file_handle
+
+                downloaded = 0
+                last_progress = -1
+                chunk_size = 1024 * 1024  # 1MB chunks for better performance
+
+                for chunk in response.iter_content(chunk_size=chunk_size):
+                    if active_downloads[download_id]['cancelled']:
+                        raise Exception("Download cancelled by user")
+
+                    if chunk:
+                        file_handle.write(chunk)
+                        downloaded += len(chunk)
+                        active_downloads[download_id]['downloaded'] = downloaded
+
+                        # Update progress every 1%
+                        progress = int((downloaded / total_size) * 100)
+                        if progress != last_progress:
+                            try:
+                                await context.bot.edit_message_text(
+                                    chat_id=update.effective_chat.id,
+                                    message_id=active_downloads[download_id]['progress_message_id'],
+                                    text=f"⏳ Downloading {filename}...\n"
+                                         f"📦 Size: {format_size(total_size)}\n"
+                                         f"⬇️ Downloaded: {format_size(downloaded)}\n"
+                                         f"📊 Progress: {progress}%\n"
+                                         f"🆔 Download ID: {download_id}\n"
+                                         f"Use /cancel {download_id} to cancel this download"
+                                )
+                                last_progress = progress
+                            except Exception as e:
+                                if "Message is not modified" not in str(e):
+                                    logger.error(f"Progress update failed: {str(e)}")
+
+                # Close the file handle
+                file_handle.close()
+                active_downloads[download_id]['file_handle'] = None
+                active_downloads[download_id]['completed'] = True
 
                 # If we get here, download was successful
                 break
 
             except Exception as e:
+                if "Download cancelled by user" in str(e):
+                    logger.info(f"Download cancelled - ID: {download_id}, User: {update.effective_user.first_name} ({update.effective_user.id}), File: {filename}")
+                    try:
+                        await context.bot.edit_message_text(
+                            chat_id=update.effective_chat.id,
+                            message_id=active_downloads[download_id]['progress_message_id'],
+                            text=f"❌ Download cancelled!\n"
+                                 f"🆔 Download ID: {download_id}"
+                        )
+                    except Exception as msg_error:
+                        logger.error(f"Error updating cancellation message: {str(msg_error)}")
+
+                    # Close file handle if it's open
+                    if file_handle and not file_handle.closed:
+                        file_handle.close()
+                    active_downloads[download_id]['file_handle'] = None
+                    active_downloads[download_id]['completed'] = True
+
+                    # Clean up the file
+                    try:
+                        if os.path.exists(filepath):
+                            os.remove(filepath)
+                    except Exception as file_error:
+                        logger.error(f"Error removing file: {str(file_error)}")
+                    return None, None
+
+                # Close file handle if it's open
+                if file_handle and not file_handle.closed:
+                    file_handle.close()
+                active_downloads[download_id]['file_handle'] = None
+
                 retry_count += 1
                 logger.error(f"Download attempt {retry_count}/{max_retries} failed: {str(e)}")
                 if retry_count < max_retries:
@@ -158,22 +287,33 @@ async def download_file(url, update, context):
                         text="⚠️ Connection interrupted. Retrying download..."
                     )
                     time.sleep(2)  # Wait before retrying
-                    response = session.get(url, stream=True, headers=headers)
-                    response.raise_for_status()
+                    try:
+                        response = session.get(url, stream=True, headers=headers)
+                        response.raise_for_status()
+                    except requests.exceptions.RequestException as e:
+                        logger.error(f"Retry failed: {str(e)}")
+                        continue
                 else:
                     raise e
 
+        # Remove from active downloads
+        if download_id in active_downloads:
+            del active_downloads[download_id]
+
         # Send completion message
-        await context.bot.edit_message_text(
-            chat_id=update.effective_chat.id,
-            message_id=progress_message.message_id,
-            text=f"✅ Download completed!\n"
-                 f"📤 Uploading {filename} to channel...\n"
-                 f"📦 Total size: {format_size(total_size)}"
-        )
+        try:
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=progress_message.message_id,
+                text=f"✅ Download completed!\n"
+                     f"📤 Uploading {filename} to channel...\n"
+                     f"📦 Total size: {format_size(total_size)}"
+            )
+        except Exception as msg_error:
+            logger.error(f"Error updating completion message: {str(msg_error)}")
 
         file_size = os.path.getsize(filepath)
-        logger.info(f"File downloaded successfully: {filename} ({format_size(file_size)})")
+        logger.info(f"Download completed - ID: {download_id}, User: {update.effective_user.first_name} ({update.effective_user.id}), File: {filename}, Size: {format_size(file_size)}")
         return filepath, filename
 
     except Exception as e:
@@ -224,12 +364,24 @@ async def upload_file_to_channel(bot, filepath, filename):
         logger.error(f"Error uploading file to channel: {str(e)}")
         return False
 
-# Command handler for /start
+def log_user_action(user, action, details=""):
+    """
+    Log user actions with timestamp and details
+    """
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    user_info = f"User: {user.first_name} (ID: {user.id})"
+    log_message = f"[{timestamp}] {user_info} - {action}"
+    if details:
+        log_message += f" - {details}"
+    print(log_message)  # Console output
+    logger.info(log_message)  # File logging
+
 async def start(update, context):
     """
     Handles the /start command with a welcoming message.
     """
     user = update.effective_user
+    log_user_action(user, "Started bot")
     welcome_message = (
         f"👋 Hello {user.first_name}! Welcome to the File Download Bot!\n\n"
         "🤖 I can help you download files from URLs and upload them to a Telegram channel.\n\n"
@@ -284,7 +436,9 @@ async def download_command(update, context):
     """
     Command handler for /download command.
     """
+    user = update.effective_user
     if not context.args:
+        log_user_action(user, "Attempted download without URL")
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text="❌ Please provide a URL to download.\n\n"
@@ -294,6 +448,15 @@ async def download_command(update, context):
         return
 
     url = context.args[0]
+    log_user_action(user, "Started download", f"URL: {url}")
+
+    # Start download in background
+    asyncio.create_task(process_download(url, update, context))
+
+async def process_download(url, update, context):
+    """
+    Process the download in the background
+    """
     try:
         # Download the file
         filepath, filename = await download_file(url, update, context)
@@ -301,22 +464,31 @@ async def download_command(update, context):
             return
 
         try:
-            # Upload to channel
-            with open(filepath, 'rb') as file:
-                await context.bot.send_document(
-                    chat_id=CHANNEL_NAME,
-                    document=file,
-                    filename=filename
+            # Upload to channel using the dedicated function
+            success = await upload_file_to_channel(context.bot, filepath, filename)
+
+            if success:
+                log_user_action(update.effective_user, "Upload successful", f"File: {filename}")
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text="✅ File has been successfully uploaded to the channel!"
                 )
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text="✅ File has been successfully uploaded to the channel!"
-            )
+            else:
+                log_user_action(update.effective_user, "Upload failed", f"File: {filename}")
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text="❌ Failed to upload to channel. Please check if:\n"
+                         "1. The bot is an admin in the channel\n"
+                         "2. The channel name is correct\n"
+                         "3. The file size is within Telegram's limits"
+                )
         except Exception as e:
             logger.error(f"Channel upload failed: {str(e)}")
+            log_user_action(update.effective_user, "Upload error", f"Error: {str(e)}")
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
-                text="❌ Failed to upload to channel. Please try again later."
+                text=f"❌ Upload failed with error: {str(e)}\n"
+                     "Please try again later or contact support if the issue persists."
             )
         finally:
             # Clean up the downloaded file
@@ -328,9 +500,142 @@ async def download_command(update, context):
 
     except Exception as e:
         logger.error(f"Command execution failed: {str(e)}")
+        log_user_action(update.effective_user, "Download error", f"Error: {str(e)}")
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text="❌ Something went wrong. Please try again later."
+        )
+
+# Command handler for /help
+async def help_command(update, context):
+    """
+    Handles the /help command with a list of available commands.
+    """
+    user = update.effective_user
+    log_user_action(user, "Requested help")
+    help_message = (
+        "🤖 Available Commands:\n\n"
+        "📝 /start - Start the bot and see welcome message\n"
+        "📥 /download <url> - Download and upload a file\n"
+        "📋 /list - Show your active downloads\n"
+        "❌ /cancel <id> - Cancel an active download\n"
+        "❓ /help - Show this help message\n\n"
+        "Example usage:\n"
+        "<code>/download https://example.com/file.pdf</code>\n"
+        "<code>/cancel abc12345</code>"
+    )
+
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=help_message,
+        parse_mode='HTML'
+    )
+
+# Command handler for /cancel
+async def cancel_command(update, context):
+    """
+    Command handler for /cancel command.
+    """
+    user = update.effective_user
+    if not context.args:
+        log_user_action(user, "Attempted to cancel without ID")
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="❌ Please provide a download ID to cancel.\n\n"
+                 "Example:\n"
+                 "`/cancel abc12345`"
+        )
+        return
+
+    download_id = context.args[0]
+    log_user_action(user, f"Attempted to cancel download", f"ID: {download_id}")
+
+    if download_id not in active_downloads:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="❌ Invalid download ID or download not found."
+        )
+        return
+
+    download_info = active_downloads[download_id]
+
+    # Check if the user is the one who started the download
+    if download_info['user_id'] != user.id:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="❌ You can only cancel your own downloads."
+        )
+        return
+
+    # Mark download as cancelled
+    download_info['cancelled'] = True
+    log_user_action(user, f"Cancelled download", f"ID: {download_id}, File: {download_info['filename']}")
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=f"🔄 Cancelling download {download_id}...\n"
+             f"File: {download_info['filename']}"
+    )
+
+# Command handler for /list
+async def list_downloads_command(update, context):
+    """
+    Command handler for /list command to show active downloads.
+    """
+    user = update.effective_user
+    log_user_action(user, "Listed downloads")
+    user_id = user.id
+
+    # Filter downloads for this user
+    user_downloads = {
+        download_id: info for download_id, info in active_downloads.items()
+        if info['user_id'] == user_id and not info.get('completed', False)
+    }
+
+    if not user_downloads:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="📭 No active downloads found."
+        )
+        return
+
+    # Create message with download information
+    message = "📥 Your Active Downloads:\n\n"
+    for download_id, info in user_downloads.items():
+        try:
+            progress = int((info['downloaded'] / info['total_size']) * 100) if info['total_size'] > 0 else 0
+            elapsed_time = datetime.now() - info['start_time']
+            elapsed_minutes = int(elapsed_time.total_seconds() / 60)
+
+            # Calculate download speed
+            if elapsed_minutes > 0:
+                speed = info['downloaded'] / elapsed_minutes / 60  # bytes per second
+                speed_str = f"⚡ {format_size(speed)}/s"
+            else:
+                speed_str = "⚡ Calculating..."
+
+            message += (
+                f"🆔 ID: {download_id}\n"
+                f"📁 File: {info['filename']}\n"
+                f"📊 Progress: {progress}%\n"
+                f"⬇️ Downloaded: {format_size(info['downloaded'])} / {format_size(info['total_size'])}\n"
+                f"⏱️ Time: {elapsed_minutes} minutes\n"
+                f"{speed_str}\n"
+                f"❌ Cancel: /cancel {download_id}\n\n"
+            )
+        except Exception as e:
+            logger.error(f"Error formatting download info for {download_id}: {str(e)}")
+            continue
+
+    try:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=message
+        )
+    except Exception as e:
+        logger.error(f"Error sending list message: {str(e)}")
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="❌ Error showing downloads. Please try again."
         )
 
 # Error handler
@@ -338,23 +643,13 @@ async def error(update, context):
     """
     Logs errors caused by updates.
     """
-    logger.error(f"Update {update} caused error {context.error}")
-
-def print_bot_info():
-    """
-    Prints bot information to console when starting
-    """
-    print("\n" + "="*50)
-    print("🤖 Telegram File Download Bot")
-    print("="*50)
-    print(f"⏰ Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"📢 Channel: {CHANNEL_NAME}")
-    print("📝 Available commands:")
-    print("  /start - Start the bot and see instructions")
-    print("  /download <url> - Download and upload a file")
-    print("="*50)
-    print("Bot is running... Press Ctrl+C to stop")
-    print("="*50 + "\n")
+    try:
+        if update:
+            logger.error(f"Update {update} caused error {context.error}")
+        else:
+            logger.error(f"Error: {context.error}")
+    except Exception as e:
+        logger.error(f"Error in error handler: {str(e)}")
 
 async def handle_message(update, context):
     """
@@ -371,7 +666,7 @@ async def handle_message(update, context):
             text="❌ Please use the /download command to download files.\n\n"
                  "Example:\n"
                  "`/download https://example.com/file.pdf`\n\n"
-                 "Type /start to see all available commands."
+                 "Type /help to see all available commands."
         )
     else:
         # Handle any other text message
@@ -382,60 +677,46 @@ async def handle_message(update, context):
                  "Please use the /download command followed by a valid URL.\n"
                  "Example:\n"
                  "`/download https://example.com/file.pdf`\n\n"
-                 "Type /start to see all available commands."
+                 "Type /help to see all available commands."
         )
-
-async def shutdown(application: Application):
-    """
-    Gracefully shutdown the bot
-    """
-    logger.info("Shutting down bot...")
-    # Stop the application
-    await application.stop()
-    # Stop the event loop
-    await application.shutdown()
-    logger.info("Bot shutdown complete")
 
 def signal_handler(signum, frame):
     """
     Handle shutdown signals
     """
-    logger.info(f"Received signal {signum}")
-    # Get the running event loop
-    loop = asyncio.get_event_loop()
-    # Create shutdown task
-    shutdown_task = loop.create_task(shutdown(application))
-    # Run the shutdown task
-    loop.run_until_complete(shutdown_task)
-    # Stop the event loop
-    loop.stop()
-    logger.info("Event loop stopped")
-    sys.exit(0)
+    print("\n" + "="*50)
+    print("Bot is shutting down...")
+    print("="*50 + "\n")
 
-async def shutdown_command(update, context):
-    """
-    Command handler for /shutdown command.
-    Only allows shutdown from authorized users.
-    """
-    # Check if user is authorized (you can modify this to check against a list of admin user IDs)
-    if update.effective_user.id not in [YOUR_ADMIN_USER_ID]:  # Replace with your admin user ID
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text="❌ You are not authorized to use this command."
-        )
-        return
+    try:
+        # First close any open file handles
+        for download_id, download_info in list(active_downloads.items()):
+            if 'file_handle' in download_info and download_info['file_handle'] is not None:
+                try:
+                    download_info['file_handle'].close()
+                    logger.info(f"Closed file handle for {download_info['filepath']}")
+                except Exception as e:
+                    logger.error(f"Error closing file handle: {str(e)}")
 
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text="🔄 Shutting down bot..."
-    )
+        # Clean up any active downloads
+        for download_id, download_info in list(active_downloads.items()):
+            # Mark downloads as cancelled to stop download loops
+            download_info['cancelled'] = True
 
-    # Log the shutdown
-    logger.info(f"Shutdown initiated by user {update.effective_user.id}")
+            try:
+                if os.path.exists(download_info['filepath']):
+                    # Try with a small delay to ensure file handles are released
+                    time.sleep(0.5)
+                    os.remove(download_info['filepath'])
+                    logger.info(f"Cleaned up file during shutdown: {download_info['filepath']}")
+            except Exception as e:
+                logger.error(f"Error cleaning up file during shutdown: {str(e)}")
+                # Don't raise the exception, just log it
+    except Exception as e:
+        logger.error(f"Error during shutdown cleanup: {str(e)}")
 
-    # Create shutdown task
-    shutdown_task = asyncio.create_task(shutdown(context.application))
-    await shutdown_task
+    # Exit without using sys.exit which can cause issues
+    os._exit(0)
 
 def main():
     """
@@ -448,26 +729,41 @@ def main():
 
         # Add handlers
         application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("help", help_command))
         application.add_handler(CommandHandler("download", download_command))
-        application.add_handler(CommandHandler("shutdown", shutdown_command))
-        # Add handler for all text messages
+        application.add_handler(CommandHandler("cancel", cancel_command))
+        application.add_handler(CommandHandler("list", list_downloads_command))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         application.add_error_handler(error)
 
-        # Print bot info
-        print_bot_info()
+        # Print startup message
+        print("\n" + "="*50)
+        print("🤖 Telegram File Download Bot")
+        print("="*50)
+        print(f"⏰ Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"📢 Channel: {CHANNEL_NAME}")
+        print("="*50)
+        print("Bot is running... Press Ctrl+C to stop")
+        print("="*50 + "\n")
 
         # Register signal handlers
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
 
-        # Start the bot
+        # Start the bot with drop_pending_updates=True to avoid conflicts
         logger.info("Starting bot...")
-        application.run_polling()
+        application.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
     except Exception as e:
         logger.error(f"Error starting bot: {str(e)}")
         sys.exit(1)
 
 if __name__ == '__main__':
-    main()
+    try:
+        # Set up asyncio policy for Windows
+        if sys.platform == 'win32':
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        main()
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}")
+        sys.exit(1)
